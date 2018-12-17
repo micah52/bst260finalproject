@@ -1,0 +1,404 @@
+---
+title: "SPAMETS R Analysis"
+author: "Micah Eades"
+date: "November 20, 2018"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+##Install Packages
+#```{r echo = FALSE}
+#install.packages("lubridate")
+#install.packages("tidyverse")
+#install.packages("caret")
+#install.packages("RANN")
+#install.packages("varian")
+#install.packages("broom")
+#install.packages("tableone")
+```
+
+##Loading libraries
+
+Note, all these packages will need to be installed first.
+```{r}
+library("lubridate")
+library("tidyverse")
+library("caret")
+library("RANN")
+library("varian")
+library("broom")
+library("tableone")
+```
+
+#Overview and Motivation:
+Cardiorespiratory fitness, is a powerful marker for all-cause mortality and a leading risk factor for cardiovascular disease. It is classically measured by maximal exercise on a treadmill and reported in units of metabolic equivalents of task (METs). Despite its benefit, this test is rarely performed because of time and cost. It is associated with daily physical activity, and so we wondered whether we could use smartphone-recorded physical activity as a low-cost and rapid means to predict fitness. 
+
+Smartphone ownership is rapidly increasing, with 77% of adults in the United States currently owning the devices. Many smartphones contain integrated accelerometers capable of recording physical activity, but the validity of this data in predicting clincial measures has not been established.
+
+#Related Work:
+1. Cao et al. used daily physical activity from a pedomoter to predict fitness with R = 0.81.
+2. Altini et al. used a wearable accelerometer/ECG to predict fitness with R=0.88.
+3. Beltrame used a Hexoskin fitness-tracking shirt to predict fitness with R = 0.87.
+
+#Initial Questions:
+Is smartphone-recorded physical activity a valid predictor for cardiorespiratory fitness? I initially set out hoping to using random forest methods to build a prediction model. 
+
+Initially hoped to use machine learning because I had 1.2 million activity observation data points, that is, about 23,000 data points for each of 51 participants. However, I only had one outcome per participant, so ultimately I only had 51 observations. This was insufficient for machine learning, so I defaulted to using multivariable regression.
+
+#Study Population:
+- Obtained IRB Approval
+- Recruited iPhone users from the Beth Israel Deaconess Medical Center Cardiovascular Clinical Physiology Stress Testing Laboratory 
+- Securely downloaded their physical activity data via Apple Health export function
+- Extracted METS from online medical record
+
+## Imported Raw Data
+```{r}
+main2train <- read.csv("/Users/micaheades/Documents/SPAMETS/R Analysis/main2train.csv", header = TRUE, sep = ",", stringsAsFactors = default.stringsAsFactors())
+```
+
+## Converted variables to appropriate formats
+This will convert columns to appropriate classes, drop unecessary columns, and rename other to have simpler names. Note this also drops secondary variables of stepspeed and distance speed
+```{r}
+##Converted times to POSIXct, which is R's time format
+main2train <- main2train %>% mutate(starttimeran = dmy_hms(starttimeran))
+main2train <- main2train %>% mutate(endtimeran = dmy_hms(endtimeran))
+main2train <- main2train %>% mutate(testdateran = dmy_hms(testdateran))
+##Converted these variables to factors
+main2train <- main2train %>% mutate(studyid = as.factor(studyid))
+main2train <- main2train %>% mutate(Random2 = as.factor(Random2))
+##Removed these unnecessary columns
+main2train$sysbp <- NULL
+main2train$diasbp <- NULL
+main2train$genderbin <- NULL
+main2train$actmets <- NULL
+main2train$metmins <- NULL
+main2train$maxhr_num <- NULL
+main2train$stepspeed <- NULL
+main2train$distancespeed <- NULL
+
+##Renamed these columns
+colnames(main2train)[colnames(main2train)=="age_num"] <- "age"
+colnames(main2train)[colnames(main2train)=="height_num"] <- "height"
+colnames(main2train)[colnames(main2train)=="weight_num"] <- "weight"
+colnames(main2train)[colnames(main2train)=="sysbp_num"] <- "sysbp"
+colnames(main2train)[colnames(main2train)=="diasbp_num"] <- "diasbp"
+colnames(main2train)[colnames(main2train)=="hr_num"] <- "hr"
+colnames(main2train)[colnames(main2train)=="steps_num"] <- "steps"
+colnames(main2train)[colnames(main2train)=="distance_num"] <- "distance"
+colnames(main2train)[colnames(main2train)=="mets_num"] <- "mets"
+##Reordered these columns
+main2train <- main2train[c("studyid", "Random2", "device", "software", "age", "gender", "height", "weight", "sysbp", "diasbp", "hr", "starttimeran", "endtimeran", "testdateran", "day", "maxday", "steps", "distance", "duration", "protocol", "ekg", "mets")]
+
+##Created binary variables for gender and METS>=10 (Female = 1). Binary METS categories will be used in future analyses.
+main2train <- main2train %>% mutate(lessthanfivemets = ifelse(main2train$mets<5,1,0))
+main2train <- main2train %>% mutate(fivetotenmets = ifelse(main2train$mets>=5 & main2train$mets<10,1,0))
+main2train <- main2train %>% mutate(morethantenmets = ifelse(main2train$mets>=10,1,0))
+main2train <- main2train %>% mutate(gender = ifelse(main2train$gender == 'F',1,0))
+
+str(main2train)
+```
+
+##Imputed missing data
+Each activity episode included steps, distance in miles, and duration in seconds. In some cases steps were missing, but distance was present and vice versa. I imputed missing steps or distance by using using whichever remaining length variable was available and the mean stride length of that individual on that day.
+
+```{r}
+#Calculated stride length
+main2train <- mutate(main2train, stridelength = distance/steps) 
+
+#Calculated mean stride length by participant and day
+main2train <- mutate(main2train, meanstridelengthbyday = ave(main2train$stridelength, c("studyid","day"), FUN=function(x) mean(x, na.rm=T)))
+
+#Imputed steps and distance using mean stride length by participant and day and whatever was available - steps or distance
+main2train <- mutate(main2train, steps = ifelse(is.na(main2train$steps),main2train$meanstridelengthbyday/main2train$distance,main2train$steps))
+
+main2train <- mutate(main2train, distance = ifelse(is.na(main2train$distance),main2train$steps*main2train$meanstridelengthbyday,main2train$distance))
+
+#Calcuated mean stride length by participant and day again so there were no missing values for these
+main2train <- mutate(main2train, stridelength = distance/steps) 
+main2train <- mutate(main2train, stepspeed = steps/duration)
+main2train <- mutate(main2train, distancespeed = distance/duration)
+
+main2train <- mutate(main2train, meanstridelengthbyday = ave(main2train$stridelength, c("studyid","day"), FUN=function(x) mean(x, na.rm=T)))
+
+#Confirmed there are no more NA values in the dataset
+sum(is.na(main2train))
+```
+
+##Examined and Cleaned Data
+Confirmed that anthropomorphic variables contained realistic values.
+```{r}
+vector <- c(5, 7:11)
+featurePlot(x = main2train[, vector], 
+            y = main2train$gender,
+            plot = "box", 
+            ## Pass in options to bwplot() 
+            scales = list(y = list(relation="free"),
+                          x = list(rot = 90)),  
+            layout = c(6,1), 
+            auto.key = list(columns = 2))
+```
+
+Steps, distance, and duration were a little more complicated because, while there were extreme values, it was difficult to identify which were false.
+```{r}
+##Steps
+main2train %>% ggplot(aes(x = steps)) +
+geom_histogram(binwidth = 10, fill = "gray", col="black")+
+  xlab("Steps") + 
+  ylab("Count")
+##Distance
+main2train %>% ggplot(aes(x = distance)) +
+geom_histogram(binwidth = 0.1, fill = "gray", col="black")+
+  xlab("Distance (miles)") + 
+  ylab("Count")
+##Duration
+main2train %>% ggplot(aes(x = duration)) +
+geom_histogram(binwidth = 10, fill = "gray", col="black")+
+  xlab("Seconds") + 
+  ylab("Count")
+```
+
+I ulimately converted these variables to speed and stride length variables. I then deleted observations with step speed >4.28 steps/second, distance speed >27.8 mph, and stride length > 2.43 m. These are world records set by Usain Bolt in the 2009 Berlin World Championships. 
+```{r}
+##Proposed cutoffs (Usain Bolt Berlin 2009 PMID: 23717364)
+main2train <- subset(main2train, stepspeed<4.23)
+main2train <- subset(main2train, distancespeed<0.00648712) 
+main2train <- subset(main2train, stridelength<0.00153479) 
+
+main2train %>% ggplot(aes(x = stepspeed)) +
+geom_histogram(binwidth = 0.1, fill = "gray", col="black")+
+  xlab("Speed (Steps/second)") + 
+  ylab("Count")
+
+main2train %>% ggplot(aes(x = distancespeed)) +
+geom_histogram(binwidth = 0.0001, fill = "gray", col="black")+
+  xlab("Speed (Miles/second)") + 
+  ylab("Count")
+
+main2train %>% ggplot(aes(x = stridelength)) +
+geom_histogram(binwidth = 0.0001, fill = "gray", col="black")+
+  xlab("Stride Length (miles)") + 
+  ylab("Count")
+```
+
+Categorical variables were distributed as expected. Note, these percentages do not account for repeated measures. Device "3,2" and software versions 4.x refer to Apple Watches.
+```{r}
+vector <- c("device", "software", "gender")
+catvars <- main2train[vector]
+CreateTableOne(data = catvars)
+```
+
+#Summary variables
+From the 23,000 activity episodes for each participant, I then extracted features which I thought might be predictive of fitness. These included variables such as total daily steps, total daily active time, peak daily speed, stridelength, etc. For each of these features, I also looked at different days of data preceding their exercise fitness stress test: 1, 3, 7, 30, 90, 180, 365 days.
+```{r}
+summary1 <- main2train %>% group_by(studyid, day) %>%
+   summarise(sumdailysteps = sum(steps),
+             sumdailydistance = sum(distance),
+             sumdailyduration = sum(duration),
+             maxdailystepspeed = max(stepspeed),
+             maxdailydistancespeed = max(distancespeed),
+             maxdailyduration = max(duration),
+             meandailystridelength = mean(stridelength),
+             dailysteprmssd = rmssd(steps),
+             dailydistancermssd = rmssd(distance),
+             dailydurationrmssd = rmssd(duration)
+   ) %>% group_by(studyid) %>%
+   summarise(meandailysteps1 = mean(sumdailysteps[day >= 0 & day <= 1]),
+             meandailysteps3 = mean(sumdailysteps[day >= 0 & day <= 3]),
+             meandailysteps7 = mean(sumdailysteps[day >= 0 & day <= 7]),
+             meandailysteps14 = mean(sumdailysteps[day >= 0 & day <= 14]),
+             meandailysteps30 = mean(sumdailysteps[day >= 0 & day <= 30]),
+             meandailysteps90 = mean(sumdailysteps[day >= 0 & day <= 90]),
+             meandailysteps180 = mean(sumdailysteps[day >= 0 & day <= 180]),
+             meandailysteps365 = mean(sumdailysteps[day >= 0 & day <= 365]),
+             meandailydistance1 = mean(sumdailydistance[day >= 0 & day <= 1]),
+             meandailydistance3 = mean(sumdailydistance[day >= 0 & day <= 3]),
+             meandailydistance7 = mean(sumdailydistance[day >= 0 & day <= 7]),
+             meandailydistance14 = mean(sumdailydistance[day >= 0 & day <= 14]),
+             meandailydistance30 = mean(sumdailydistance[day >= 0 & day <= 30]),
+             meandailydistance90 = mean(sumdailydistance[day >= 0 & day <= 90]),
+             meandailydistance180 = mean(sumdailydistance[day >= 0 & day <= 180]),
+             meandailydistance365 = mean(sumdailydistance[day >= 0 & day <= 365]),
+             meandailyduration1 = mean(sumdailyduration[day >= 0 & day <= 1]),
+             meandailyduration3 = mean(sumdailyduration[day >= 0 & day <= 3]),
+             meandailyduration7 = mean(sumdailyduration[day >= 0 & day <= 7]),
+             meandailyduration14 = mean(sumdailyduration[day >= 0 & day <= 14]),
+             meandailyduration30 = mean(sumdailyduration[day >= 0 & day <= 30]),
+             meandailyduration90 = mean(sumdailyduration[day >= 0 & day <= 90]),
+             meandailyduration180 = mean(sumdailyduration[day >= 0 & day <= 180]),
+             meandailyduration365 = mean(sumdailyduration[day >= 0 & day <= 365]),
+             maxdailystepspeed1 = max(maxdailystepspeed[day >= 0 & day <= 1]),
+             maxdailystepspeed3 = max(maxdailystepspeed[day >= 0 & day <= 3]),
+             maxdailystepspeed7 = max(maxdailystepspeed[day >= 0 & day <= 7]),
+             maxdailystepspeed14 = max(maxdailystepspeed[day >= 0 & day <= 14]),
+             maxdailystepspeed30 = max(maxdailystepspeed[day >= 0 & day <= 30]),
+             maxdailystepspeed90 = max(maxdailystepspeed[day >= 0 & day <= 90]),
+             maxdailystepspeed180 = max(maxdailystepspeed[day >= 0 & day <= 180]),
+             maxdailystepspeed365 = max(maxdailystepspeed[day >= 0 & day <= 365]),
+             maxdailydistancespeed1 = max(maxdailydistancespeed[day >= 0 & day <= 1]),
+             maxdailydistancespeed3 = max(maxdailydistancespeed[day >= 0 & day <= 3]),
+             maxdailydistancespeed7 = max(maxdailydistancespeed[day >= 0 & day <= 7]),
+             maxdailydistancespeed14 = max(maxdailydistancespeed[day >= 0 & day <= 14]),
+             maxdailydistancespeed30 = max(maxdailydistancespeed[day >= 0 & day <= 30]),
+             maxdailydistancespeed90 = max(maxdailydistancespeed[day >= 0 & day <= 90]),
+             maxdailydistancespeed180 = max(maxdailydistancespeed[day >= 0 & day <= 180]),
+             maxdailydistancespeed365 = max(maxdailydistancespeed[day >= 0 & day <= 365]),
+             maxdailyduration1 = max(maxdailyduration[day >= 0 & day <= 1]),
+             maxdailyduration3 = max(maxdailyduration[day >= 0 & day <= 3]),
+             maxdailyduration7 = max(maxdailyduration[day >= 0 & day <= 7]),
+             maxdailyduration14 = max(maxdailyduration[day >= 0 & day <= 14]),
+             maxdailyduration30 = max(maxdailyduration[day >= 0 & day <= 30]),
+             maxdailyduration90 = max(maxdailyduration[day >= 0 & day <= 90]),
+             maxdailyduration180 = max(maxdailyduration[day >= 0 & day <= 180]),
+             maxdailyduration365 = max(maxdailyduration[day >= 0 & day <= 365]),
+             meanmaxdailystepspeed1 = mean(maxdailystepspeed[day >= 0 & day <= 1]),
+             meanmaxdailystepspeed3 = mean(maxdailystepspeed[day >= 0 & day <= 3]),
+             meanmaxdailystepspeed7 = mean(maxdailystepspeed[day >= 0 & day <= 7]),
+             meanmaxdailystepspeed14 = mean(maxdailystepspeed[day >= 0 & day <= 14]),
+             meanmaxdailystepspeed30 = mean(maxdailystepspeed[day >= 0 & day <= 30]),
+             meanmaxdailystepspeed90 = mean(maxdailystepspeed[day >= 0 & day <= 90]),
+             meanmaxdailystepspeed180 = mean(maxdailystepspeed[day >= 0 & day <= 180]),
+             meanmaxdailystepspeed365 = mean(maxdailystepspeed[day >= 0 & day <= 365]),
+             meanmaxdailydistancespeed1 = mean(maxdailydistancespeed[day >= 0 & day <= 1]),
+             meanmaxdailydistancespeed3 = mean(maxdailydistancespeed[day >= 0 & day <= 3]),
+             meanmaxdailydistancespeed7 = mean(maxdailydistancespeed[day >= 0 & day <= 7]),
+             meanmaxdailydistancespeed14 = mean(maxdailydistancespeed[day >= 0 & day <= 14]),
+             meanmaxdailydistancespeed30 = mean(maxdailydistancespeed[day >= 0 & day <= 30]),
+             meanmaxdailydistancespeed90 = mean(maxdailydistancespeed[day >= 0 & day <= 90]),
+             meanmaxdailydistancespeed180 = mean(maxdailydistancespeed[day >= 0 & day <= 180]),
+             meanmaxdailydistancespeed365 = mean(maxdailydistancespeed[day >= 0 & day <= 365]),
+             meanmaxdailyduration1 = mean(maxdailyduration[day >= 0 & day <= 1]),
+             meanmaxdailyduration3 = mean(maxdailyduration[day >= 0 & day <= 3]),
+             meanmaxdailyduration7 = mean(maxdailyduration[day >= 0 & day <= 7]),
+             meanmaxdailyduration14 = mean(maxdailyduration[day >= 0 & day <= 14]),
+             meanmaxdailyduration30 = mean(maxdailyduration[day >= 0 & day <= 30]),
+             meanmaxdailyduration90 = mean(maxdailyduration[day >= 0 & day <= 90]),
+             meanmaxdailyduration180 = mean(maxdailyduration[day >= 0 & day <= 180]),
+             meanmaxdailyduration365 = mean(maxdailyduration[day >= 0 & day <= 365]),
+             meandailystridelength1 = mean(meandailystridelength[day >= 0 & day <= 1]),
+             meandailystridelength3 = mean(meandailystridelength[day >= 0 & day <= 3]),
+             meandailystridelength7 = mean(meandailystridelength[day >= 0 & day <= 7]),
+             meandailystridelength14 = mean(meandailystridelength[day >= 0 & day <= 14]),
+             meandailystridelength30 = mean(meandailystridelength[day >= 0 & day <= 30]),
+             meandailystridelength90 = mean(meandailystridelength[day >= 0 & day <= 90]),
+             meandailystridelength180 = mean(meandailystridelength[day >= 0 & day <= 180]),
+             meandailystridelength365 = mean(meandailystridelength[day >= 0 & day <= 365]),
+             dailysteprmssd1 = rmssd(sumdailysteps[day >= 0 & day <= 1]),
+             dailysteprmssd3 = rmssd(sumdailysteps[day >= 0 & day <= 3]),
+             dailysteprmssd7 = rmssd(sumdailysteps[day >= 0 & day <= 7]),
+             dailysteprmssd14 = rmssd(sumdailysteps[day >= 0 & day <= 14]),
+             dailysteprmssd30 = rmssd(sumdailysteps[day >= 0 & day <= 30]),
+             dailysteprmssd90 = rmssd(sumdailysteps[day >= 0 & day <= 90]),
+             dailysteprmssd180 = rmssd(sumdailysteps[day >= 0 & day <= 180]),
+             dailysteprmssd365 = rmssd(sumdailysteps[day >= 0 & day <= 365]),
+             dailydistancermssd1 = rmssd(sumdailydistance[day >= 0 & day <= 1]),
+             dailydistancermssd3 = rmssd(sumdailydistance[day >= 0 & day <= 3]),
+             dailydistancermssd7 = rmssd(sumdailydistance[day >= 0 & day <= 7]),
+             dailydistancermssd14 = rmssd(sumdailydistance[day >= 0 & day <= 14]),
+             dailydistancermssd30 = rmssd(sumdailydistance[day >= 0 & day <= 30]),
+             dailydistancermssd90 = rmssd(sumdailydistance[day >= 0 & day <= 90]),
+             dailydistancermssd180 = rmssd(sumdailydistance[day >= 0 & day <= 180]),
+             dailydistancermssd365 = rmssd(sumdailydistance[day >= 0 & day <= 365]),
+             dailydurationrmssd1 = rmssd(sumdailyduration[day >= 0 & day <= 1]),
+             dailydurationrmssd3 = rmssd(sumdailyduration[day >= 0 & day <= 3]),
+             dailydurationrmssd7 = rmssd(sumdailyduration[day >= 0 & day <= 7]),
+             dailydurationrmssd14 = rmssd(sumdailyduration[day >= 0 & day <= 14]),
+             dailydurationrmssd30 = rmssd(sumdailyduration[day >= 0 & day <= 30]),
+             dailydurationrmssd90 = rmssd(sumdailyduration[day >= 0 & day <= 90]),
+             dailydurationrmssd180 = rmssd(sumdailyduration[day >= 0 & day <= 180]),
+             dailydurationrmssd365 = rmssd(sumdailyduration[day >= 0 & day <= 365]),
+             dailystepslope3 = (mean(sumdailysteps[day >= 3 & day <= 5])-mean(sumdailysteps[day >= 0 & day <= 2]))/3,
+dailystepslope7 = (mean(sumdailysteps[day >= 7 & day <= 9])-mean(sumdailysteps[day >= 0 & day <= 2]))/7,
+dailystepslope14 = (mean(sumdailysteps[day >= 14 & day <= 16])-mean(sumdailysteps[day >= 0 & day <= 2]))/14,
+dailystepslope30 = (mean(sumdailysteps[day >= 30 & day <= 32])-mean(sumdailysteps[day >= 0 & day <= 2]))/30,
+dailystepslope90 = (mean(sumdailysteps[day >= 90 & day <= 92])-mean(sumdailysteps[day >= 0 & day <= 2]))/90,
+dailystepslope180 = (mean(sumdailysteps[day >= 180 & day <= 182])-mean(sumdailysteps[day >= 0 & day <= 2]))/180,
+dailystepslope365 = (mean(sumdailysteps[day >= 365 & day <= 367])-mean(sumdailysteps[day >= 0 & day <= 2]))/365,
+             dailydistancelope3 = (mean(sumdailydistance[day >= 3 & day <= 5])-mean(sumdailydistance[day >= 0 & day <= 2]))/3,
+dailydistanceslope7 = (mean(sumdailydistance[day >= 7 & day <= 9])-mean(sumdailydistance[day >= 0 & day <= 2]))/7,
+dailydistanceslope14 = (mean(sumdailydistance[day >= 14 & day <= 16])-mean(sumdailydistance[day >= 0 & day <= 2]))/14,
+dailydistanceslope30 = (mean(sumdailydistance[day >= 30 & day <= 32])-mean(sumdailydistance[day >= 0 & day <= 2]))/30,
+dailydistanceslope90 = (mean(sumdailydistance[day >= 90 & day <= 92])-mean(sumdailydistance[day >= 0 & day <= 2]))/90,
+dailydistanceslope180 = (mean(sumdailydistance[day >= 180 & day <= 182])-mean(sumdailydistance[day >= 0 & day <= 2]))/180,
+dailydistanceslope365 = (mean(sumdailydistance[day >= 365 & day <= 367])-mean(sumdailydistance[day >= 0 & day <= 2]))/365,
+             dailydurationslope3 = (mean(sumdailyduration[day >= 3 & day <= 5])-mean(sumdailyduration[day >= 0 & day <= 2]))/3,
+dailydurationslope7 = (mean(sumdailyduration[day >= 7 & day <= 9])-mean(sumdailyduration[day >= 0 & day <= 2]))/7,
+dailydurationslope14 = (mean(sumdailyduration[day >= 14 & day <= 16])-mean(sumdailyduration[day >= 0 & day <= 2]))/14,
+dailydurationslope30 = (mean(sumdailyduration[day >= 30 & day <= 32])-mean(sumdailyduration[day >= 0 & day <= 2]))/30,
+dailydurationslope90 = (mean(sumdailyduration[day >= 90 & day <= 92])-mean(sumdailyduration[day >= 0 & day <= 2]))/90,
+dailydurationslope180 = (mean(sumdailyduration[day >= 180 & day <= 182])-mean(sumdailyduration[day >= 0 & day <= 2]))/180,
+dailydurationslope365 = (mean(sumdailyduration[day >= 365 & day <= 367])-mean(sumdailyduration[day >= 0 & day <= 2]))/365,
+               maxdailystepspeedslope3 = (mean(maxdailystepspeed [day >= 3 & day <= 5])-mean(maxdailystepspeed [day >= 0 & day <= 2]))/3,
+maxdailystepspeedslope7 = (mean(maxdailystepspeed [day >= 7 & day <= 9])-mean(maxdailystepspeed [day >= 0 & day <= 2]))/7,
+maxdailystepspeedslope14 = (mean(maxdailystepspeed [day >= 14 & day <= 16])-mean(maxdailystepspeed [day >= 0 & day <= 2]))/14,
+maxdailystepspeedslope30 = (mean(maxdailystepspeed [day >= 30 & day <= 32])-mean(maxdailystepspeed [day >= 0 & day <= 2]))/30,
+maxdailystepspeedslope90 = (mean(maxdailystepspeed [day >= 90 & day <= 92])-mean(maxdailystepspeed [day >= 0 & day <= 2]))/90,
+maxdailystepspeedslope180 = (mean(maxdailystepspeed [day >= 180 & day <= 182])-mean(maxdailystepspeed [day >= 0 & day <= 2]))/180,
+maxdailystepspeedslope365 = (mean(maxdailystepspeed [day >= 365 & day <= 367])-mean(maxdailystepspeed [day >= 0 & day <= 2]))/365,
+               maxdailydistancespeedslope3 = (mean(maxdailydistancespeed [day >= 3 & day <= 5])-mean(maxdailydistancespeed [day >= 0 & day <= 2]))/3,
+maxdailydistancespeedslope7 = (mean(maxdailydistancespeed [day >= 7 & day <= 9])-mean(maxdailydistancespeed [day >= 0 & day <= 2]))/7,
+maxdailydistancespeedslope14 = (mean(maxdailydistancespeed [day >= 14 & day <= 16])-mean(maxdailydistancespeed [day >= 0 & day <= 2]))/14,
+maxdailydistancespeedslope30 = (mean(maxdailydistancespeed [day >= 30 & day <= 32])-mean(maxdailydistancespeed [day >= 0 & day <= 2]))/30,
+maxdailydistancespeedslope90 = (mean(maxdailydistancespeed [day >= 90 & day <= 92])-mean(maxdailydistancespeed [day >= 0 & day <= 2]))/90,
+maxdailydistancespeedslope180 = (mean(maxdailydistancespeed [day >= 180 & day <= 182])-mean(maxdailydistancespeed [day >= 0 & day <= 2]))/180,
+maxdailydistancespeedslope365 = (mean(maxdailydistancespeed [day >= 365 & day <= 367])-mean(maxdailydistancespeed [day >= 0 & day <= 2]))/365,
+               maxdailydurationslope3 = (mean(maxdailyduration [day >= 3 & day <= 5])-mean(maxdailyduration [day >= 0 & day <= 2]))/3,
+maxdailydurationslope7 = (mean(maxdailyduration [day >= 7 & day <= 9])-mean(maxdailyduration [day >= 0 & day <= 2]))/7,
+maxdailydurationslope14 = (mean(maxdailyduration [day >= 14 & day <= 16])-mean(maxdailyduration [day >= 0 & day <= 2]))/14,
+maxdailydurationslope30 = (mean(maxdailyduration [day >= 30 & day <= 32])-mean(maxdailyduration [day >= 0 & day <= 2]))/30,
+maxdailydurationslope90 = (mean(maxdailyduration [day >= 90 & day <= 92])-mean(maxdailyduration [day >= 0 & day <= 2]))/90,
+maxdailydurationslope180 = (mean(maxdailyduration [day >= 180 & day <= 182])-mean(maxdailyduration [day >= 0 & day <= 2]))/180,
+maxdailydurationslope365 = (mean(maxdailyduration [day >= 365 & day <= 367])-mean(maxdailyduration [day >= 0 & day <= 2]))/365,
+               meandailystridelengthslope3 = (mean(meandailystridelength [day >= 3 & day <= 5])-mean(meandailystridelength [day >= 0 & day <= 2]))/3,
+meandailystridelengthslope7 = (mean(meandailystridelength [day >= 7 & day <= 9])-mean(meandailystridelength [day >= 0 & day <= 2]))/7,
+meandailystridelengthslope14 = (mean(meandailystridelength [day >= 14 & day <= 16])-mean(meandailystridelength [day >= 0 & day <= 2]))/14,
+meandailystridelengthslope30 = (mean(meandailystridelength [day >= 30 & day <= 32])-mean(meandailystridelength [day >= 0 & day <= 2]))/30,
+meandailystridelengthslope90 = (mean(meandailystridelength [day >= 90 & day <= 92])-mean(meandailystridelength [day >= 0 & day <= 2]))/90,
+meandailystridelengthslope180 = (mean(meandailystridelength [day >= 180 & day <= 182])-mean(meandailystridelength [day >= 0 & day <= 2]))/180,
+meandailystridelengthslope365 = (mean(meandailystridelength [day >= 365 & day <= 367])-mean(meandailystridelength [day >= 0 & day <= 2]))/365
+)
+```
+
+```{r}
+summary2 <- main2train %>% group_by(studyid) %>% summarise(
+     age = first(age),
+     gender = first(gender),
+     height = first(height),
+     weight = first(weight),
+     bmi = ((first(weight)/2.2)/((first(height)*0.0254)^2)),
+     sysbp = first(sysbp),
+     diasbp = first(diasbp),
+     restinghr = first(hr),
+     mets = first(mets),
+     lessthanfivemets = first(lessthanfivemets),
+     fivetotenmets = first(fivetotenmets),
+     morethantenmets = first(morethantenmets)
+)
+summary <- merge(summary2, summary1,by="studyid")
+```
+
+##Test best-performing model
+```{r}
+lm(mets ~ age + gender + bmi + meandailysteps7 + meanmaxdailydistancespeed30 + meandailystridelength365, data = summary)
+```
+
+##Report estimates, standard errors, and p-values from model
+```{r}
+fit <- lm(mets ~ age + gender + bmi + meandailysteps7 + meanmaxdailydistancespeed30 + meandailystridelength365, data = summary)
+tidy(fit)
+```
+
+##Report model fit summary
+```{r}
+glance(fit)
+```
+
+```{r}
+summary %>% 
+  mutate(mets_hat = predict(fit, newdata = .)) %>%
+  ggplot(aes(mets_hat, mets)) + 
+  geom_point() +
+  geom_abline()+
+  xlab("Predicted METs") + 
+  ylab("Observed METs")
+```
